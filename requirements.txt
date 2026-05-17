@@ -1,0 +1,16 @@
+# Core Dependencies for RaceCar RL Homework
+# Install with: pip install -r requirements.txt
+
+# Numerical Computing
+numpy>=1.21.0
+
+# Reinforcement Learning Environment
+gymnasium>=0.26.0
+
+# Deep Learning Framework
+# Note: For GPU support, install torch with CUDA:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+torch>=2.0.0
+
+# Visualization
+pygame>=2.1.0
