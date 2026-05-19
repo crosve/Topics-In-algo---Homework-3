@@ -36,13 +36,44 @@ class SquashedGaussianActor(nn.Module):
         log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
         return mu, log_std
 
-    # TODO: Implement the sampling function for the Squashed Gaussian policy. Remember to apply the tanh squashing and adjust log probabilities accordingly.
     def sample(
         self, obs_t: torch.Tensor, deterministic: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Dim-0 is speed command in [0, 1], others remain in [-1, 1]
-        # return action, log_prob
-        raise NotImplementedError("Actor sampling not implemented yet.")
+        # --- Student Implementation Start ---
+        mu, log_std = self.forward(obs_t)
+        std = log_std.exp()
+        
+        # Define base Gaussian distribution
+        dist = Normal(mu, std)
+        
+        if deterministic:
+            raw_action = mu
+        else:
+            # Reparameterization trick (mean + std * noise)
+            raw_action = dist.rsample()
+            
+        # 1. Apply hyperbolic tangent squashing
+        bounded = torch.tanh(raw_action)
+        
+        # 2. Map actions according to environment criteria:
+        # Dim-0: speed command shifted to [0, 1]
+        # Dim-1+: steering/other dimensions remain in [-1, 1]
+        first = 0.5 * (bounded[..., :1] + 1.0)
+        rest = bounded[..., 1:]
+        action = torch.cat([first, rest], dim=-1)
+        
+        # 3. Calculate squashed log probability
+        # Log probability of base normal distribution
+        log_prob = dist.log_prob(raw_action).sum(dim=-1)
+        
+        # Enforce change-of-variables correction formula for tanh squashing:
+        # log prob -= sum(log(1 - tanh(x)^2))
+        # Numerical stability constant 1e-6 added to avoid log(0)
+        correction = torch.log(1.0 - bounded.pow(2) + 1e-6).sum(dim=-1)
+        log_prob = log_prob - correction
+        
+        return action, log_prob
+        # --- Student Implementation End ---
 
 
 class Critic(nn.Module):
@@ -101,11 +132,10 @@ class SACAgent(HomeworkAgent):
         return action.squeeze(0).cpu().numpy().astype(np.float32)
 
     def _soft_update(self):
-        # TODO: Implement soft update of target critic parameters using self.tau
         # --- Student Implementation Start ---
-        # Implement soft update logic here
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
         # --- Student Implementation End ---
-        raise NotImplementedError("Soft update not implemented yet.")
 
     def train_step(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
         required = ["obs", "actions", "rewards", "next_obs", "dones"]
@@ -119,55 +149,55 @@ class SACAgent(HomeworkAgent):
         next_obs = self._tensor(batch["next_obs"])
         dones = self._tensor(batch["dones"]).squeeze(-1)
 
-        # TODO: Compute Target Q-Values
-        # HINT: Sample next_actions from the actor for next_obs
-        # Calculate target_q = r + gamma * (1 - d) * (min. Q1/Q2_target - alpha * log_prob)
+        # ==========================================
+        # 1. COMPUTE TARGET Q-VALUES
+        # ==========================================
         with torch.no_grad():
             next_actions, next_logp = self.actor.sample(next_obs, deterministic=False)
-
+            
             # --- Student Implementation Start ---
-            # Implement target Q value logic here
-            target = torch.zeros_like(rewards)  # Replace with true target calculation
+            # Evaluate next actions with the target twin critics
+            target_q1, target_q2 = self.critic_target(next_obs, next_actions)
+            min_target_q = torch.min(target_q1, target_q2)
+            
+            # Entropy-regularized Bellman equation
+            target = rewards + self.gamma * (1.0 - dones) * (min_target_q - self.alpha * next_logp)
             # --- Student Implementation End ---
 
-        # TODO: Critic Update
-        # HINT: Get current Q1 and Q2 estimates arrays from self.critic
-        # Compute MSE loss vs your `target`
+        # ==========================================
+        # 2. CRITIC UPDATE
+        # ==========================================
         # --- Student Implementation Start ---
         q1, q2 = self.critic(obs, actions)
-        critic_loss = torch.tensor(
-            0.0, requires_grad=True, device=self.device
-        )  # Replace with MSE loss
+        critic_loss = F.mse_loss(q1, target) + F.mse_loss(q2, target)
         # --- Student Implementation End ---
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
         self.critic_opt.step()
 
-        # TODO: Actor and Alpha update
-        # HINT: Sample new actions from observation obs via self.actor
-        # Minimize actor loss defined via the delayed critic Q-networks
-        # Calculate actor_loss and alpha_loss
-
+        # ==========================================
+        # 3. ACTOR UPDATE
+        # ==========================================
         # --- Student Implementation Start ---
         new_actions, logp = self.actor.sample(obs, deterministic=False)
         q1_pi, q2_pi = self.critic(obs, new_actions)
         q_pi = torch.min(q1_pi, q2_pi)
 
-        actor_loss = torch.tensor(
-            0.0, requires_grad=True, device=self.device
-        )  # Replace
+        # Maximize expected return and entropy -> Minimize -(Q - alpha * log_prob)
+        actor_loss = (self.alpha.detach() * logp - q_pi).mean()
         # --- Student Implementation End ---
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
         self.actor_opt.step()
 
+        # ==========================================
+        # 4. TEMPERATURE (ALPHA) AUTOMATIC TUNING
+        # ==========================================
         # --- Student Implementation Start ---
-        # Update alpha based on self.target_entropy
-        alpha_loss = torch.tensor(
-            0.0, requires_grad=True, device=self.device
-        )  # Replace
+        # Temperature objective optimization function
+        alpha_loss = (-self.log_alpha * (logp + self.target_entropy).detach()).mean()
         # --- Student Implementation End ---
 
         self.alpha_opt.zero_grad()
@@ -176,6 +206,7 @@ class SACAgent(HomeworkAgent):
 
         # Soft update target critics
         self._soft_update()
+        
         return {
             "critic_loss": float(critic_loss.item()),
             "actor_loss": float(actor_loss.item()),

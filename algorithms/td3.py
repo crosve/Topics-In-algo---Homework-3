@@ -91,9 +91,14 @@ class TD3Agent(HomeworkAgent):
     # TODO: Implement the TD3 training step following the algorithm. You can refer to the TD3 paper for more details: https://arxiv.org/abs/1802.09477
     def _soft_update(self):
         # --- Student Implementation Start ---
-        # Implement soft update logic here
+        # Update Critic Target Weights: Q_target = tau * Q_current + (1 - tau) * Q_target
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+
+        # Update Actor Target Weights: pi_target = tau * pi_current + (1 - tau) * pi_target
+        for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
         # --- Student Implementation End ---
-        raise NotImplementedError("Soft update not implemented yet.")
 
     def train_step(self, batch: Dict[str, np.ndarray]) -> Dict[str, float]:
         required = ["obs", "actions", "rewards", "next_obs", "dones"]
@@ -112,45 +117,66 @@ class TD3Agent(HomeworkAgent):
         # Compute the target Q-value: r + gamma * (1-done) * min(Q1_target, Q2_target)
         # --- Student Code Below ---
         with torch.no_grad():
-            next_actions = None  # Hint: sample from self.actor_target(next_obs), don't forget self._transform_action
-            # Add clipped noise based on self.policy_noise and self.noise_clip
-            # Target calculation goes here
+            # Generate the next action using target policy and structural constraints
+            raw_next_actions = self.actor_target(next_obs)
+            next_actions = self._transform_action(raw_next_actions)
+            
+            # Target Policy Smoothing: generate noise, clip it, and add to next action
+            noise = torch.randn_like(next_actions) * self.policy_noise
+            noise = torch.clamp(noise, -self.noise_clip, self.noise_clip)
+            smoothed_next_actions = next_actions + noise
+            
+            # Enforce execution workspace constraints explicitly
+            low_bounds = torch.tensor([0.0] + [-1.0] * (self.action_dim - 1), device=self.device)
+            high_bounds = torch.tensor([1.0] + [1.0] * (self.action_dim - 1), device=self.device)
+            smoothed_next_actions = torch.max(torch.min(smoothed_next_actions, high_bounds), low_bounds)
+            
+            # Evaluate using twin target critics and apply pessimistic estimation
+            target_q1, target_q2 = self.critic_target(next_obs, smoothed_next_actions)
+            min_target_q = torch.min(target_q1, target_q2)
+            
+            # Standard Bellman expectation step
+            target_q = rewards + self.gamma * (1.0 - dones) * min_target_q
 
-        # Feed [obs, actions] to current critics
+        # Evaluate current critic network performance
+        q1, q2 = self.critic(obs, actions)
+        critic_loss = F.mse_loss(q1, target_q) + F.mse_loss(q2, target_q)
 
-        # MSE Loss for Critic Q1 & Q2
-        # Calculate MSE here
+        # Optimize current critic structures
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        self.critic_opt.step()
 
-        # Optimize critic
-        # return critic_loss in metrics for logging critic_loss, actor_loss and mean_q
-        # metrics = {
-        #     "critic_loss": float(critic_loss.item()),
-        #     "actor_loss": 0.0,
-        #     "mean_q": float(torch.min(q1, q2).mean().item()),
-        # }
+        # Initialize tracking metrics with standard defaults
+        metrics = {
+            "critic_loss": float(critic_loss.item()),
+            "actor_loss": 0.0,
+            "mean_q": float(torch.min(q1, q2).mean().item()),
+        }
+
+        # ==========================================
+        # 2. DELAYED POLICY & TARGET UPDATE
+        # ==========================================
+        if self.train_step_count % self.policy_delay == 0:
+            # Deterministic Policy Gradient optimization: Maximize Q1 performance
+            actor_actions = self._transform_action(self.actor(obs))
+            actor_loss = -self.critic.q1_only(obs, actor_actions).mean()
+
+            # Optimize primary actor network configurations
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
+            self.actor_opt.step()
+
+            # Slowly update target structures toward current evaluation properties
+            self._soft_update()
+            
+            # Overwrite defaults inside reporting structures
+            metrics["actor_loss"] = float(actor_loss.item())
+
+        # Step management mechanics
+        self.train_step_count += 1
+        return metrics
         # --- Student Code End ---
-
-        # TODO: Delayed Policy (Actor) Update
-        # Update the actor policy and target networks every `policy_delay` steps
-        # if self.train_step_count % self.policy_delay == 0:
-        # --- Student Code Below ---
-
-        # 1. Infer actions through actor and compute deterministic actor loss
-        # actor_actions = ?
-        # actor_loss = ? # Maximize Q1(obs, actor_actions) -> Minimize -Q1(obs, actor_actions)
-
-        # Optimize actor
-        # --- Student Code End ---
-
-        # Soft update of targets
-        # Log actor_loss in metrics
-        # metrics["actor_loss"] = float(actor_loss.item())
-        # --- Student Code End ---
-
-        # Increment train step count and return metrics for logging
-        # self.train_step_count += 1
-        # return metrics
-        raise NotImplementedError("TD3 train_step not implemented yet.")
 
     def save(self, path: str) -> None:
         torch.save(

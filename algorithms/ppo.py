@@ -71,17 +71,19 @@ class PPOAgent(HomeworkAgent):
 
     @torch.no_grad()
     def sample_action(self, observation: np.ndarray) -> Tuple[np.ndarray, float, float]:
-        # TODO: Implement action sampling that returns the action, log probability, and value estimate for the given observation.
-        # --- Student Implementation Start ---
-        # Implement action sampling logic and value estimation here
-        # --- Student Implementation End ---
-        # return (
-        #     action.squeeze(0).cpu().numpy().astype(np.float32),
-        #     float(log_prob.item()),
-        #     float(value.item()),
-        # )
-        raise NotImplementedError("Action sampling not implemented yet.")
-
+        obs_t = self._tensor(observation).unsqueeze(0)
+        
+        dist = self._distribution(obs_t)
+        action = dist.sample()
+        
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        value = self._value(obs_t)
+        
+        return (
+            action.squeeze(0).cpu().numpy().astype(np.float32),
+            float(log_prob.item()),
+            float(value.item()),
+        )
     @torch.no_grad()
     def value(self, observation: np.ndarray) -> float:
         obs_t = self._tensor(observation).unsqueeze(0)
@@ -108,37 +110,51 @@ class PPOAgent(HomeworkAgent):
         returns_t = self._tensor(batch["returns"])
         advantages_t = self._tensor(batch["advantages"])
 
-        # TODO: Normalize advantages here for training stability.
-        # --- Student Implementation Start ---
-        # Ensure your advantage matches the typical definitions.
-        # Get current log probabilities, entropy, and value estimates for the batch actions and observations.
+        # 2. Evaluate current actions to get fresh parameters
+        log_probs, entropy, values = self.evaluate_actions(batch["obs"], batch["actions"])
 
-        # TODO: Compute the policy ratio (pi_theta / pi_theta_old)
-        # HINT: You can use exponentiated log probabilities to get the ratio.
+        # 3. Compute the policy ratio: r_t(theta) = pi_theta / pi_theta_old
+        ratios = torch.exp(log_probs - old_log_probs)
 
-        # TODO: Compute the surrogate loss terms
+        # 4. Compute surrogate loss terms
+        surr1 = ratios * advantages_t
+        surr2 = torch.clamp(ratios, 1.0 - self.clip_range, 1.0 + self.clip_range) * advantages_t
+        
+        # Policy loss uses a negative sign because we maximize via PyTorch gradient minimization
+        policy_loss = -torch.min(surr1, surr2).mean()
 
-        # TODO: Compute value loss and entropy loss
+        # 5. Compute mean-squared error value loss
+        value_loss = nn.functional.mse_loss(values, returns_t)
 
-        # TODO: Combine losses using value_coef and entropy_coef
-        # loss = (
-        #     policy_loss
-        #     + self.value_coef * value_loss
-        #     + self.entropy_coef * entropy_loss
-        # )  # <-- Verify or adjust this weighting
+        # 6. Compute entropy loss (maximizing entropy helps exploration, so we subtract it)
+        entropy_loss = -entropy.mean()
 
-        # Optimize the combined loss and perform gradient clipping
+        # 7. Combine total loss terms
+        loss = (
+            policy_loss
+            + self.value_coef * value_loss
+            + self.entropy_coef * entropy_loss
+        )
 
-        # TODO: Return training metrics such as total loss, policy loss, value loss, and entropy for logging purposes.
-        # return {
-        #     "loss": float(loss.item()),
-        #     "policy_loss": float(policy_loss.item()),
-        #     "value_loss": float(value_loss.item()),
-        #     "entropy": float(entropy.mean().item()),
-        # }
-        # --- Student Implementation End ---
-        raise NotImplementedError("PPO train_step not implemented yet.")
+        # 8. Optimization step
+        self.optimizer.zero_grad()
+        loss.backward()
+        
+        # Max gradient norm clipping prevents exploding gradients
+        if self.max_grad_norm > 0:
+            nn.utils.clip_grad_norm_(
+                list(self.actor.parameters()) + list(self.critic.parameters()) + [self.log_std],
+                self.max_grad_norm
+            )
+        self.optimizer.step()
 
+        # 9. Return execution metrics for telemetry
+        return {
+            "loss": float(loss.item()),
+            "policy_loss": float(policy_loss.item()),
+            "value_loss": float(value_loss.item()),
+            "entropy": float(entropy.mean().item()),
+        }
     def save(self, path: str) -> None:
         torch.save(
             {
